@@ -53,7 +53,6 @@ impl SingleExecMatcher {
 
 impl Matcher for SingleExecMatcher {
     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
-        let mut command = Command::new(&self.executable);
         let path_to_file = if self.exec_in_parent_dir {
             if let Some(f) = file_info.path().file_name() {
                 Path::new(".").join(f)
@@ -62,6 +61,14 @@ impl Matcher for SingleExecMatcher {
             }
         } else {
             file_info.path().to_path_buf()
+        };
+
+        // POSIX requires that a utility_name or argument consisting solely of "{}"
+        // be replaced with the matched pathname — including when "{}" is the executable.
+        let mut command = if self.executable == "{}" {
+            Command::new(&path_to_file)
+        } else {
+            Command::new(&self.executable)
         };
 
         for arg in &self.args {
@@ -122,8 +129,18 @@ impl MultiExecMatcher {
         })
     }
 
-    fn new_command(&self) -> argmax::Command {
-        let mut command = argmax::Command::new(&self.executable);
+    /// Constructs a fresh command, pre-loaded with the fixed arguments.
+    /// `first_path` is the first matched path for this batch; it is used as
+    /// the executable when the executable expression is "{}".
+    fn new_command(&self, first_path: &Path) -> argmax::Command {
+        // POSIX requires that a utility_name or argument consisting solely of "{}"
+        // be replaced with the matched pathname — including when "{}" is the executable.
+        let exe = if self.executable == "{}" {
+            first_path.as_os_str()
+        } else {
+            std::ffi::OsStr::new(&self.executable)
+        };
+        let mut command = argmax::Command::new(exe);
         command.try_args(&self.args).unwrap();
         command
     }
@@ -155,7 +172,7 @@ impl Matcher for MultiExecMatcher {
             file_info.path().to_path_buf()
         };
         let mut command = self.command.borrow_mut();
-        let command = command.get_or_insert_with(|| self.new_command());
+        let command = command.get_or_insert_with(|| self.new_command(&path_to_file));
 
         // Build command, or dispatch it before when it is long enough.
         if command.try_arg(&path_to_file).is_err() {
@@ -176,7 +193,7 @@ impl Matcher for MultiExecMatcher {
             self.run_command(command, matcher_io);
 
             // Reset command status.
-            *command = self.new_command();
+            *command = self.new_command(&path_to_file);
             if let Err(e) = command.try_arg(&path_to_file) {
                 writeln!(
                     &mut stderr(),

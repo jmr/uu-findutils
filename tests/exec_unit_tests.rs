@@ -336,3 +336,74 @@ fn multi_set_exit_code_if_command_fails() {
     matcher.finished_dir(Path::new("test_data/simple"), &mut matcher_io);
     assert!(matcher_io.exit_code() == 1);
 }
+
+/// Regression test for issue #614: {} as the executable in -exec {} args \;
+/// should be replaced with the matched pathname, not run literally.
+#[test]
+fn single_executable_placeholder_is_replaced() {
+    let temp_dir = Builder::new()
+        .prefix("single_executable_placeholder_is_replaced")
+        .tempdir()
+        .unwrap();
+    let temp_dir_path = temp_dir.path().to_string_lossy();
+
+    // Point the WalkEntry at testing-commandline itself, so that when {}
+    // is substituted with the matched path, it executes testing-commandline.
+    let testing_commandline = path_to_testing_commandline();
+    let tc_path = Path::new(&testing_commandline);
+    let tc_parent = tc_path.parent().unwrap().to_str().unwrap();
+    let tc_name = tc_path.file_name().unwrap().to_str().unwrap();
+    let entry = get_dir_entry_for(tc_parent, tc_name);
+
+    let matcher = SingleExecMatcher::new("{}", &[temp_dir_path.as_ref()], false)
+        .expect("Failed to create matcher");
+    let deps = FakeDependencies::new();
+    assert!(matcher.matches(&entry, &mut deps.new_matcher_io()));
+
+    // testing-commandline should have run and written its output file
+    let mut f = File::open(temp_dir.path().join("1.txt"))
+        .expect("testing-commandline was not executed (output file missing)");
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .expect("failed to read output file");
+    assert!(
+        s.starts_with("cwd="),
+        "unexpected output from testing-commandline: {s}"
+    );
+}
+
+/// Regression test for issue #614: {} as the executable in -exec {} args {}... +
+/// should be replaced with the matched pathname.
+#[test]
+fn multi_executable_placeholder_is_replaced() {
+    let temp_dir = Builder::new()
+        .prefix("multi_executable_placeholder_is_replaced")
+        .tempdir()
+        .unwrap();
+    let temp_dir_path = temp_dir.path().to_string_lossy();
+
+    let testing_commandline = path_to_testing_commandline();
+    let tc_path = Path::new(&testing_commandline);
+    let tc_parent = tc_path.parent().unwrap().to_str().unwrap();
+    let tc_name = tc_path.file_name().unwrap().to_str().unwrap();
+    let entry = get_dir_entry_for(tc_parent, tc_name);
+
+    // executable={}, args=[tempdir] — matched path is appended, so
+    // testing-commandline gets called as: <path> <tempdir> <path>
+    let matcher = MultiExecMatcher::new("{}", &[temp_dir_path.as_ref()], false)
+        .expect("Failed to create matcher");
+    let deps = FakeDependencies::new();
+    let mut matcher_io = deps.new_matcher_io();
+    assert!(matcher.matches(&entry, &mut matcher_io));
+    matcher.finished(&mut matcher_io);
+
+    let mut f = File::open(temp_dir.path().join("1.txt"))
+        .expect("testing-commandline was not executed (output file missing)");
+    let mut s = String::new();
+    f.read_to_string(&mut s)
+        .expect("failed to read output file");
+    assert!(
+        s.starts_with("cwd="),
+        "unexpected output from testing-commandline: {s}"
+    );
+}

@@ -23,7 +23,9 @@ use std::os::unix::fs::symlink;
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
 
-use common::test_helpers::fix_up_slashes;
+use std::path::Path;
+
+use common::test_helpers::{fix_up_slashes, path_to_testing_commandline};
 
 mod common;
 
@@ -1202,4 +1204,82 @@ fn find_slashes() {
         .assert()
         .success()
         .stderr(predicate::str::is_empty());
+}
+
+/// Regression test for issue #614: `find DIR -name NAME -exec {} args \;`
+/// should replace {} with the matched path and execute it, not try to run
+/// the literal string "{}".
+#[test]
+fn exec_placeholder_as_executable() {
+    let temp_dir = Builder::new()
+        .prefix("exec_placeholder_as_executable")
+        .tempdir()
+        .unwrap();
+
+    let testing_commandline = path_to_testing_commandline();
+    let tc_path = Path::new(&testing_commandline);
+    let tc_dir = tc_path.parent().unwrap();
+    let tc_name = tc_path.file_name().unwrap().to_str().unwrap();
+
+    // Use {} as the executable: find should replace it with the matched path
+    // (testing-commandline), which then runs and writes its output to temp_dir.
+    cargo_bin_cmd!("find")
+        .args([
+            tc_dir.to_str().unwrap(),
+            "-maxdepth",
+            "1",
+            "-name",
+            tc_name,
+            "-exec",
+            "{}",
+            temp_dir.path().to_str().unwrap(),
+            ";",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    assert!(
+        temp_dir.path().join("1.txt").exists(),
+        "testing-commandline was not executed — {{}} was not replaced with the matched path"
+    );
+}
+
+/// Regression test for issue #614: `find DIR -name NAME -exec {} args {} +`
+/// should replace {} in the utility position with the matched path.
+#[test]
+fn exec_placeholder_as_executable_multi() {
+    let temp_dir = Builder::new()
+        .prefix("exec_placeholder_as_executable_multi")
+        .tempdir()
+        .unwrap();
+
+    let testing_commandline = path_to_testing_commandline();
+    let tc_path = Path::new(&testing_commandline);
+    let tc_dir = tc_path.parent().unwrap();
+    let tc_name = tc_path.file_name().unwrap().to_str().unwrap();
+
+    // Use {} as the executable with the + form: find should replace it with
+    // the matched path (testing-commandline), which runs and writes to temp_dir.
+    cargo_bin_cmd!("find")
+        .args([
+            tc_dir.to_str().unwrap(),
+            "-maxdepth",
+            "1",
+            "-name",
+            tc_name,
+            "-exec",
+            "{}",
+            temp_dir.path().to_str().unwrap(),
+            "{}",
+            "+",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    assert!(
+        temp_dir.path().join("1.txt").exists(),
+        "testing-commandline was not executed — {{}} was not replaced with the matched path"
+    );
 }
