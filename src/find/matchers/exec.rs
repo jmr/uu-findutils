@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{stderr, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{Matcher, MatcherIO, WalkEntry};
@@ -18,8 +18,52 @@ enum Arg {
     LiteralArg(OsString),
 }
 
+impl Arg {
+    fn new(a: &str) -> Self {
+        let parts = a.split("{}").collect::<Vec<_>>();
+        if parts.len() == 1 {
+            // No {} present
+            Arg::LiteralArg(OsString::from(a))
+        } else {
+            Arg::FileArg(parts.iter().map(OsString::from).collect())
+        }
+    }
+
+    fn render(&self, path_to_file: &std::ffi::OsStr) -> OsString {
+        match self {
+            Arg::LiteralArg(ref a) => a.clone(),
+            Arg::FileArg(ref parts) => parts.join(path_to_file),
+        }
+    }
+
+    fn to_string_lossy(&self) -> String {
+        match self {
+            Arg::LiteralArg(ref a) => a.to_string_lossy().into_owned(),
+            Arg::FileArg(ref parts) => {
+                let s_parts: Vec<_> = parts.iter().map(|p| p.to_string_lossy()).collect();
+                s_parts.join("{}")
+            }
+        }
+    }
+}
+
+/// Helper to get the path to the file being matched, potentially relative to its parent
+/// if `exec_in_parent_dir` is true (for -execdir).
+fn get_path_to_file(file_info: &WalkEntry, exec_in_parent_dir: bool) -> PathBuf {
+    if exec_in_parent_dir {
+        if let Some(f) = file_info.path().file_name() {
+            Path::new(".").join(f)
+        } else {
+            // For root directories or other cases without a file name, use the full path.
+            Path::new(".").join(file_info.path())
+        }
+    } else {
+        file_info.path().to_path_buf()
+    }
+}
+
 pub struct SingleExecMatcher {
-    executable: String,
+    executable: Arg,
     args: Vec<Arg>,
     exec_in_parent_dir: bool,
 }
@@ -30,21 +74,10 @@ impl SingleExecMatcher {
         args: &[&str],
         exec_in_parent_dir: bool,
     ) -> Result<Self, Box<dyn Error>> {
-        let transformed_args = args
-            .iter()
-            .map(|&a| {
-                let parts = a.split("{}").collect::<Vec<_>>();
-                if parts.len() == 1 {
-                    // No {} present
-                    Arg::LiteralArg(OsString::from(a))
-                } else {
-                    Arg::FileArg(parts.iter().map(OsString::from).collect())
-                }
-            })
-            .collect();
+        let transformed_args = args.iter().map(|&a| Arg::new(a)).collect();
 
         Ok(Self {
-            executable: executable.to_string(),
+            executable: Arg::new(executable),
             args: transformed_args,
             exec_in_parent_dir,
         })
@@ -53,29 +86,17 @@ impl SingleExecMatcher {
 
 impl Matcher for SingleExecMatcher {
     fn matches(&self, file_info: &WalkEntry, _: &mut MatcherIO) -> bool {
-        let path_to_file = if self.exec_in_parent_dir {
-            if let Some(f) = file_info.path().file_name() {
-                Path::new(".").join(f)
-            } else {
-                Path::new(".").join(file_info.path())
-            }
-        } else {
-            file_info.path().to_path_buf()
-        };
+        let path_to_file = get_path_to_file(file_info, self.exec_in_parent_dir);
 
         // POSIX requires that a utility_name or argument consisting solely of "{}"
-        // be replaced with the matched pathname — including when "{}" is the executable.
-        let mut command = if self.executable == "{}" {
-            Command::new(&path_to_file)
-        } else {
-            Command::new(&self.executable)
-        };
+        // be replaced with the matched pathname. If it includes "{}" but is not
+        // solely "{}", POSIX says the behavior is implementation-defined. We follow
+        // GNU find and replace "{}" everywhere, including embedded within the utility_name.
+        let exe_os_string = self.executable.render(path_to_file.as_os_str());
+        let mut command = Command::new(&exe_os_string);
 
         for arg in &self.args {
-            match *arg {
-                Arg::LiteralArg(ref a) => command.arg(a.as_os_str()),
-                Arg::FileArg(ref parts) => command.arg(parts.join(path_to_file.as_os_str())),
-            };
+            command.arg(arg.render(path_to_file.as_os_str()));
         }
         if self.exec_in_parent_dir {
             match file_info.path().parent() {
@@ -94,7 +115,8 @@ impl Matcher for SingleExecMatcher {
         match command.status() {
             Ok(status) => status.success(),
             Err(e) => {
-                writeln!(&mut stderr(), "Failed to run {}: {}", self.executable, e).unwrap();
+                let exe_str = exe_os_string.to_string_lossy();
+                writeln!(&mut stderr(), "Failed to run {exe_str}: {e}").unwrap();
                 false
             }
         }
@@ -106,7 +128,7 @@ impl Matcher for SingleExecMatcher {
 }
 
 pub struct MultiExecMatcher {
-    executable: String,
+    executable: Arg,
     args: Vec<OsString>,
     exec_in_parent_dir: bool,
     /// Command to build while matching.
@@ -122,7 +144,7 @@ impl MultiExecMatcher {
         let transformed_args = args.iter().map(OsString::from).collect();
 
         Ok(Self {
-            executable: executable.to_string(),
+            executable: Arg::new(executable),
             args: transformed_args,
             exec_in_parent_dir,
             command: RefCell::new(None),
@@ -134,13 +156,11 @@ impl MultiExecMatcher {
     /// the executable when the executable expression is "{}".
     fn new_command(&self, first_path: &Path) -> argmax::Command {
         // POSIX requires that a utility_name or argument consisting solely of "{}"
-        // be replaced with the matched pathname — including when "{}" is the executable.
-        let exe = if self.executable == "{}" {
-            first_path.as_os_str()
-        } else {
-            std::ffi::OsStr::new(&self.executable)
-        };
-        let mut command = argmax::Command::new(exe);
+        // be replaced with the matched pathname. If it includes "{}" but is not
+        // solely "{}", POSIX says the behavior is implementation-defined. We follow
+        // GNU find and replace "{}" everywhere, including embedded within the utility_name.
+        let exe_os_string = self.executable.render(first_path.as_os_str());
+        let mut command = argmax::Command::new(exe_os_string);
         command.try_args(&self.args).unwrap();
         command
     }
@@ -153,7 +173,8 @@ impl MultiExecMatcher {
                 }
             }
             Err(e) => {
-                writeln!(&mut stderr(), "Failed to run {}: {}", self.executable, e).unwrap();
+                let exe_str = self.executable.to_string_lossy();
+                writeln!(&mut stderr(), "Failed to run {exe_str}: {e}").unwrap();
                 matcher_io.set_exit_code(1);
             }
         }
@@ -162,15 +183,7 @@ impl MultiExecMatcher {
 
 impl Matcher for MultiExecMatcher {
     fn matches(&self, file_info: &WalkEntry, matcher_io: &mut MatcherIO) -> bool {
-        let path_to_file = if self.exec_in_parent_dir {
-            if let Some(f) = file_info.path().file_name() {
-                Path::new(".").join(f)
-            } else {
-                Path::new(".").join(file_info.path())
-            }
-        } else {
-            file_info.path().to_path_buf()
-        };
+        let path_to_file = get_path_to_file(file_info, self.exec_in_parent_dir);
         let mut command = self.command.borrow_mut();
         let command = command.get_or_insert_with(|| self.new_command(&path_to_file));
 
